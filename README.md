@@ -9,6 +9,7 @@ por Groq con function calling.
 - `app/database.py`: conexión, esquema e inicialización idempotente de SQLite.
 - `app/tools.py`: reglas de consulta, entradas y ventas de inventario.
 - `app/agent.py`: schemas, whitelist y orquestación de las llamadas a herramientas.
+- `app/memory.py`: historial en proceso, aislado y sincronizado por conversación.
 - `app/main.py`: endpoints locales, incluido `POST /agent/chat`.
 - `tests/test_tools.py`: pruebas aisladas con una base temporal por prueba.
 - `data/`: ubicación predeterminada de la base SQLite local.
@@ -52,13 +53,40 @@ Prueba el agente localmente desde otra consola:
 Invoke-RestMethod -Method Post `
   -Uri http://127.0.0.1:8000/agent/chat `
   -ContentType "application/json" `
-  -Body '{"message":"¿Cuántas camisetas negras tenemos?"}'
+  -Body '{"conversation_id":"demo-001","message":"¿Cuántas camisetas negras tenemos?"}'
+```
+
+Para continuar el mismo diálogo, reutiliza `conversation_id`:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8000/agent/chat `
+  -ContentType "application/json" `
+  -Body '{"conversation_id":"demo-001","message":"Vende 2."}'
+```
+
+El segundo turno recibe los mensajes `user` y `assistant` anteriores, por lo que
+puede resolver que “2” se refiere a camisetas negras. Conversaciones con IDs
+distintos mantienen historiales independientes. En una futura integración,
+WhatsApp podrá aportar el identificador del remitente como `conversation_id`.
+
+Para limpiar únicamente esa conversación:
+
+```powershell
+Invoke-RestMethod -Method Delete `
+  -Uri http://127.0.0.1:8000/agent/conversations/demo-001
 ```
 
 El modelo `llama-3.3-70b-versatile` recibe schemas de las cuatro operaciones. Si
 solicita una función, la aplicación valida el JSON y el nombre contra una
 whitelist, ejecuta la función local de `app/tools.py` y devuelve el resultado al
 modelo para redactar la respuesta final. El modelo no modifica SQLite directamente.
+
+La memoria conserva en orden los últimos 10 turnos completos (20 mensajes) y
+recorta siempre pares `user`/`assistant`. Es memoria en proceso: se pierde al
+reiniciar la aplicación y solo es coherente dentro de un worker o instancia. Para
+escalar horizontalmente se necesitará más adelante un almacén compartido como
+Redis, que no forma parte de esta fase.
 
 ## Ejecutar las pruebas
 

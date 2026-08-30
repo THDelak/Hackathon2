@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from groq import Groq
 
+from app.memory import ConversationMemory, conversation_memory
 from app.tools import InventarioError, consultar_inventario, listar_productos, registrar_entrada, registrar_venta
 
 MODEL = "llama-3.3-70b-versatile"
@@ -113,8 +114,25 @@ def _mensaje_asistente(message: Any) -> dict[str, Any]:
     }
 
 
-def procesar_mensaje(mensaje: str, *, client: Any | None = None) -> str:
-    """Procesa lenguaje natural y ejecuta únicamente herramientas autorizadas."""
+def _validar_conversation_id(conversation_id: str) -> str | None:
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        return None
+    if len(conversation_id.strip()) > 128:
+        return None
+    return conversation_id.strip()
+
+
+def procesar_mensaje(
+    conversation_id: str,
+    mensaje: str,
+    *,
+    client: Any | None = None,
+    memory: ConversationMemory = conversation_memory,
+) -> str:
+    """Procesa un turno usando el historial aislado de la conversación."""
+    normalized_id = _validar_conversation_id(conversation_id)
+    if normalized_id is None:
+        return "El conversation_id debe ser texto no vacío de hasta 128 caracteres."
     if not isinstance(mensaje, str) or not mensaje.strip():
         return "El mensaje no puede estar vacío."
     if client is None:
@@ -123,37 +141,50 @@ def procesar_mensaje(mensaje: str, *, client: Any | None = None) -> str:
             return "El agente no está configurado: falta la variable GROQ_API_KEY."
         client = Groq(api_key=api_key)
 
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": mensaje.strip()},
-    ]
-    try:
-        completion = client.chat.completions.create(
-            model=MODEL, messages=messages, tools=TOOL_SCHEMAS, tool_choice="auto"
-        )
-        assistant_message = completion.choices[0].message
-        tool_calls = assistant_message.tool_calls or []
-        if not tool_calls:
-            return assistant_message.content or "No pude generar una respuesta."
+    user_message = mensaje.strip()
+    with memory.conversation(normalized_id):
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *memory.get_history(normalized_id),
+            {"role": "user", "content": user_message},
+        ]
 
-        messages.append(_mensaje_asistente(assistant_message))
-        for tool_call in tool_calls:
-            nombre = tool_call.function.name
-            if nombre not in TOOLS_MAP:
-                return f"La herramienta solicitada no está permitida: {nombre}."
-            try:
-                argumentos = _validar_argumentos(nombre, tool_call.function.arguments)
-                resultado = TOOLS_MAP[nombre](**argumentos)
-                contenido = json.dumps({"ok": True, "resultado": resultado}, ensure_ascii=False)
-            except ArgumentosToolError as error:
-                return f"No se pudo ejecutar la herramienta: {error}"
-            except InventarioError as error:
-                contenido = json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False)
-            messages.append(
-                {"role": "tool", "tool_call_id": tool_call.id, "name": nombre, "content": contenido}
+        def remember(response: str) -> str:
+            memory.add_exchange(normalized_id, user_message, response)
+            return response
+
+        try:
+            completion = client.chat.completions.create(
+                model=MODEL, messages=messages, tools=TOOL_SCHEMAS, tool_choice="auto"
             )
+            assistant_message = completion.choices[0].message
+            tool_calls = assistant_message.tool_calls or []
+            if not tool_calls:
+                return remember(assistant_message.content or "No pude generar una respuesta.")
 
-        final = client.chat.completions.create(model=MODEL, messages=messages)
-        return final.choices[0].message.content or "La operación terminó sin respuesta."
-    except Exception:
-        return "No fue posible comunicarse con el proveedor Groq. Inténtalo de nuevo más tarde."
+            messages.append(_mensaje_asistente(assistant_message))
+            for tool_call in tool_calls:
+                nombre = tool_call.function.name
+                if nombre not in TOOLS_MAP:
+                    return remember(f"La herramienta solicitada no está permitida: {nombre}.")
+                try:
+                    argumentos = _validar_argumentos(nombre, tool_call.function.arguments)
+                    resultado = TOOLS_MAP[nombre](**argumentos)
+                    contenido = json.dumps({"ok": True, "resultado": resultado}, ensure_ascii=False)
+                except ArgumentosToolError as error:
+                    return remember(f"No se pudo ejecutar la herramienta: {error}")
+                except InventarioError as error:
+                    contenido = json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": nombre,
+                        "content": contenido,
+                    }
+                )
+
+            final = client.chat.completions.create(model=MODEL, messages=messages)
+            return remember(final.choices[0].message.content or "La operación terminó sin respuesta.")
+        except Exception:
+            return "No fue posible comunicarse con el proveedor Groq. Inténtalo de nuevo más tarde."

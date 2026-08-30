@@ -4,6 +4,7 @@ import pytest
 
 from app import database
 from app.agent import procesar_mensaje
+from app.memory import ConversationMemory, conversation_memory
 from app.tools import consultar_inventario
 
 
@@ -37,6 +38,7 @@ class ClienteFake:
 
 @pytest.fixture(autouse=True)
 def base_de_datos_temporal(tmp_path, monkeypatch):
+    conversation_memory.clear_all()
     monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "agent_test.db")
     database.initialize_database()
 
@@ -50,7 +52,7 @@ def base_de_datos_temporal(tmp_path, monkeypatch):
 )
 def test_operaciones_de_lectura(nombre, argumentos, texto_final):
     client = ClienteFake(respuesta_tool(nombre, argumentos), respuesta_texto(texto_final))
-    assert procesar_mensaje("Consulta el inventario", client=client) == texto_final
+    assert procesar_mensaje("test", "Consulta el inventario", client=client) == texto_final
     tool_result = client.requests[1]["messages"][-1]
     assert tool_result["role"] == "tool"
     assert '"ok": true' in tool_result["content"]
@@ -61,7 +63,7 @@ def test_entrada_pasa_por_la_funcion_real_de_negocio():
         respuesta_tool("registrar_entrada", '{"producto":"Gorra","cantidad":3}'),
         respuesta_texto("Entrada registrada; ahora hay 11 gorras."),
     )
-    assert "11" in procesar_mensaje("Recibimos 3 gorras", client=client)
+    assert "11" in procesar_mensaje("test", "Recibimos 3 gorras", client=client)
     assert consultar_inventario("Gorra")["stock"] == 11
 
 
@@ -70,7 +72,7 @@ def test_venta_valida_pasa_por_la_funcion_real_de_negocio():
         respuesta_tool("registrar_venta", '{"producto":"Sudadera","cantidad":2}'),
         respuesta_texto("Venta registrada; quedan 3 sudaderas."),
     )
-    assert "3" in procesar_mensaje("Vendimos 2 sudaderas", client=client)
+    assert "3" in procesar_mensaje("test", "Vendimos 2 sudaderas", client=client)
     assert consultar_inventario("Sudadera")["stock"] == 3
 
 
@@ -79,7 +81,7 @@ def test_venta_con_stock_insuficiente_se_devuelve_al_modelo_sin_modificar_stock(
         respuesta_tool("registrar_venta", '{"producto":"Sudadera","cantidad":9}'),
         respuesta_texto("No hay stock suficiente."),
     )
-    assert procesar_mensaje("Vende 9 sudaderas", client=client) == "No hay stock suficiente."
+    assert procesar_mensaje("test", "Vende 9 sudaderas", client=client) == "No hay stock suficiente."
     assert '"ok": false' in client.requests[1]["messages"][-1]["content"]
     assert consultar_inventario("Sudadera")["stock"] == 5
 
@@ -89,7 +91,7 @@ def test_producto_inexistente_se_devuelve_al_modelo():
         respuesta_tool("consultar_inventario", '{"producto":"Pantalón"}'),
         respuesta_texto("Ese producto no existe en el inventario."),
     )
-    assert procesar_mensaje("Consulta pantalones", client=client) == (
+    assert procesar_mensaje("test", "Consulta pantalones", client=client) == (
         "Ese producto no existe en el inventario."
     )
     assert '"ok": false' in client.requests[1]["messages"][-1]["content"]
@@ -97,7 +99,7 @@ def test_producto_inexistente_se_devuelve_al_modelo():
 
 def test_tool_desconocida_no_se_ejecuta():
     client = ClienteFake(respuesta_tool("borrar_inventario", "{}"))
-    respuesta = procesar_mensaje("Borra todo", client=client)
+    respuesta = procesar_mensaje("test", "Borra todo", client=client)
     assert "no está permitida" in respuesta
     assert len(client.requests) == 1
 
@@ -105,19 +107,83 @@ def test_tool_desconocida_no_se_ejecuta():
 @pytest.mark.parametrize("argumentos", ["{invalido", '{"producto":"Gorra"}'])
 def test_argumentos_invalidos_no_se_ejecutan(argumentos):
     client = ClienteFake(respuesta_tool("registrar_venta", argumentos))
-    respuesta = procesar_mensaje("Registra una venta", client=client)
+    respuesta = procesar_mensaje("test", "Registra una venta", client=client)
     assert "No se pudo ejecutar" in respuesta
     assert consultar_inventario("Gorra")["stock"] == 8
 
 
 def test_error_del_proveedor_es_controlado():
     client = ClienteFake(RuntimeError("error que no debe mostrarse"))
-    respuesta = procesar_mensaje("Lista productos", client=client)
+    respuesta = procesar_mensaje("test", "Lista productos", client=client)
     assert respuesta == "No fue posible comunicarse con el proveedor Groq. Inténtalo de nuevo más tarde."
     assert "error que no debe mostrarse" not in respuesta
 
 
 def test_ausencia_de_api_key(monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    respuesta = procesar_mensaje("Lista productos")
+    respuesta = procesar_mensaje("test", "Lista productos")
     assert respuesta == "El agente no está configurado: falta la variable GROQ_API_KEY."
+
+
+def test_segundo_turno_recibe_contexto_y_resuelve_una_venta():
+    memory = ConversationMemory()
+    client = ClienteFake(
+        respuesta_tool("consultar_inventario", '{"producto":"Camiseta negra"}'),
+        respuesta_texto("Hay 10 camisetas negras."),
+        respuesta_tool("registrar_venta", '{"producto":"Camiseta negra","cantidad":2}'),
+        respuesta_texto("Venta registrada; quedan 8 camisetas negras."),
+    )
+    procesar_mensaje("demo-001", "¿Cuántas camisetas negras tenemos?", client=client, memory=memory)
+    respuesta = procesar_mensaje("demo-001", "Vende 2.", client=client, memory=memory)
+
+    segundo_turno = client.requests[2]["messages"]
+    assert segundo_turno[1:3] == [
+        {"role": "user", "content": "¿Cuántas camisetas negras tenemos?"},
+        {"role": "assistant", "content": "Hay 10 camisetas negras."},
+    ]
+    assert respuesta == "Venta registrada; quedan 8 camisetas negras."
+    assert consultar_inventario("Camiseta negra")["stock"] == 8
+
+
+def test_conversaciones_estan_aisladas():
+    memory = ConversationMemory()
+    client_a = ClienteFake(respuesta_texto("Contexto A"))
+    client_b = ClienteFake(respuesta_texto("Contexto B"))
+    procesar_mensaje("usuario-a", "Mensaje A", client=client_a, memory=memory)
+    procesar_mensaje("usuario-b", "Mensaje B", client=client_b, memory=memory)
+
+    assert memory.get_history("usuario-a")[0]["content"] == "Mensaje A"
+    assert memory.get_history("usuario-b")[0]["content"] == "Mensaje B"
+    assert all(message["content"] != "Mensaje A" for message in client_b.requests[0]["messages"])
+
+
+def test_limpiar_conversacion_no_limpia_otra():
+    memory = ConversationMemory()
+    memory.add_exchange("a", "Pregunta A", "Respuesta A")
+    memory.add_exchange("b", "Pregunta B", "Respuesta B")
+
+    assert memory.clear("a") is True
+    assert memory.clear("a") is False
+    assert memory.get_history("a") == []
+    assert len(memory.get_history("b")) == 2
+
+
+def test_limite_recorta_turnos_completos_en_orden():
+    memory = ConversationMemory(max_turns=2)
+    for number in range(3):
+        memory.add_exchange("demo", f"u{number}", f"a{number}")
+
+    assert memory.get_history("demo") == [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+
+
+@pytest.mark.parametrize("conversation_id", ["", "   ", None, "x" * 129])
+def test_conversation_id_invalido_se_rechaza(conversation_id):
+    client = ClienteFake(respuesta_texto("No debe usarse"))
+    respuesta = procesar_mensaje(conversation_id, "Hola", client=client)
+    assert "conversation_id" in respuesta
+    assert client.requests == []
