@@ -38,5 +38,5 @@ Thumbs.db
 ngrok.yml
 
 # Temporary Twilio Sandbox adapter
-twilio_test/
-.env.twilio
+#twilio_test/
+#.env.twilio
