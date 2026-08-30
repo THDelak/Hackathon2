@@ -1,6 +1,8 @@
 """Adaptador de entrada y salida para WhatsApp Cloud API."""
 
 import os
+import hashlib
+import hmac
 from collections import OrderedDict
 from dataclasses import dataclass
 from threading import RLock
@@ -34,7 +36,7 @@ class RecentMessageIds:
         if capacity <= 0:
             raise ValueError("capacity debe ser mayor que cero.")
         self.capacity = capacity
-        self._ids: OrderedDict[str, None] = OrderedDict()
+        self._ids: OrderedDict[str, str] = OrderedDict()
         self._lock = RLock()
 
     def claim(self, message_id: str) -> bool:
@@ -42,10 +44,20 @@ class RecentMessageIds:
         with self._lock:
             if message_id in self._ids:
                 return False
-            self._ids[message_id] = None
+            self._ids[message_id] = "processing"
             while len(self._ids) > self.capacity:
                 self._ids.popitem(last=False)
             return True
+
+    def complete(self, message_id: str) -> None:
+        """Marca como completo un ID previamente reservado."""
+        with self._lock:
+            if message_id in self._ids:
+                self._ids[message_id] = "completed"
+
+    def status(self, message_id: str) -> str | None:
+        with self._lock:
+            return self._ids.get(message_id)
 
     def clear(self) -> None:
         with self._lock:
@@ -53,6 +65,22 @@ class RecentMessageIds:
 
 
 processed_message_ids = RecentMessageIds(capacity=1000)
+
+
+def verify_webhook_signature(
+    raw_body: bytes,
+    signature: str | None,
+    *,
+    app_secret: str | None = None,
+) -> bool:
+    """Valida X-Hub-Signature-256; sin secret habilita explícitamente modo desarrollo."""
+    secret = app_secret if app_secret is not None else os.getenv("META_APP_SECRET")
+    if not secret:
+        return True
+    if not signature or not signature.startswith("sha256="):
+        return False
+    expected = "sha256=" + hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
 
 
 def parse_webhook_payload(payload: Any) -> list[IncomingTextMessage]:
@@ -125,4 +153,5 @@ def handle_webhook_payload(
         if not message_ids.claim(incoming.message_id):
             continue
         response = agent(incoming.sender, incoming.body)
+        message_ids.complete(incoming.message_id)
         sender(incoming.sender, response)

@@ -236,3 +236,19 @@ def test_respuesta_del_modelo_con_secreto_se_bloquea_y_no_se_guarda(monkeypatch)
 
     assert respuesta == SAFE_OUTPUT_REJECTION
     assert "secreto-simulado-987" not in str(memory.get_history("demo"))
+
+
+def test_cliente_groq_recibe_timeout_explicito(monkeypatch):
+    import app.agent as agent_module
+
+    captured = {}
+    fake_client = ClienteFake(respuesta_texto("Respuesta directa"))
+
+    def fake_groq(**kwargs):
+        captured.update(kwargs)
+        return fake_client
+
+    monkeypatch.setenv("GROQ_API_KEY", "groq-key-de-prueba")
+    monkeypatch.setattr(agent_module, "Groq", fake_groq)
+    assert agent_module.procesar_mensaje("timeout", "Lista productos") == "Respuesta directa"
+    assert captured == {"api_key": "groq-key-de-prueba", "timeout": 30.0}

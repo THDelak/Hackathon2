@@ -2,16 +2,17 @@
 
 from contextlib import asynccontextmanager
 import os
+import json
 from typing import Any
 
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field, field_validator
 from app.agent import procesar_mensaje
 from app.database import initialize_database
 from app.memory import conversation_memory
 from app.tools import listar_productos
-from app.whatsapp import handle_webhook_payload
+from app.whatsapp import handle_webhook_payload, verify_webhook_signature
 
 
 @asynccontextmanager
@@ -72,6 +73,16 @@ def verify_webhook(
 
 
 @app.post("/webhook")
-def receive_webhook(payload: Any = Body(...)) -> dict[str, str]:
+async def receive_webhook(
+    request: Request,
+    x_hub_signature_256: str | None = Header(default=None, alias="X-Hub-Signature-256"),
+) -> dict[str, str]:
+    raw_body = await request.body()
+    if not verify_webhook_signature(raw_body, x_hub_signature_256):
+        raise HTTPException(status_code=403, detail="Invalid webhook signature.")
+    try:
+        payload: Any = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {"status": "ignored"}
     handle_webhook_payload(payload)
     return {"status": "received"}

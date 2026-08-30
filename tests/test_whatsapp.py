@@ -1,4 +1,7 @@
 from types import SimpleNamespace
+import hashlib
+import hmac
+import json
 
 import httpx
 import pytest
@@ -114,6 +117,68 @@ def test_post_webhook_malformado_responde_200(monkeypatch):
     assert calls == [{"payload": "malformado"}]
 
 
+def signed_request(payload, secret):
+    raw_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return raw_body, {"Content-Type": "application/json", "X-Hub-Signature-256": f"sha256={digest}"}
+
+
+def test_firma_meta_valida_permite_procesamiento(monkeypatch):
+    secret = "meta-app-secret-de-prueba"
+    monkeypatch.setenv("META_APP_SECRET", secret)
+    calls = []
+    monkeypatch.setattr(main, "handle_webhook_payload", calls.append)
+    payload = text_payload()
+    raw_body, headers = signed_request(payload, secret)
+
+    response = client.post("/webhook", content=raw_body, headers=headers)
+
+    assert response.status_code == 200
+    assert calls == [payload]
+
+
+@pytest.mark.parametrize("signature", [None, "sha256=incorrecta", "sha1=incorrecta"])
+def test_firma_meta_ausente_o_incorrecta_rechaza_sin_procesar(monkeypatch, signature):
+    monkeypatch.setenv("META_APP_SECRET", "meta-app-secret-de-prueba")
+    calls = []
+    monkeypatch.setattr(main, "handle_webhook_payload", calls.append)
+    headers = {"Content-Type": "application/json"}
+    if signature:
+        headers["X-Hub-Signature-256"] = signature
+
+    response = client.post("/webhook", content=b'{"entry":[]}', headers=headers)
+
+    assert response.status_code == 403
+    assert calls == []
+    assert "meta-app-secret-de-prueba" not in response.text
+
+
+def test_sin_meta_app_secret_permite_modo_desarrollo(monkeypatch):
+    monkeypatch.delenv("META_APP_SECRET", raising=False)
+    calls = []
+    monkeypatch.setattr(main, "handle_webhook_payload", calls.append)
+    response = client.post("/webhook", json={"entry": []})
+    assert response.status_code == 200
+    assert calls == [{"entry": []}]
+
+
+def test_firma_invalida_no_ejecuta_tools_ni_modifica_inventario(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "signature_test.db")
+    database.initialize_database()
+    monkeypatch.setenv("META_APP_SECRET", "meta-app-secret-de-prueba")
+    initial_stock = consultar_inventario("Gorra")["stock"]
+    payload = text_payload(body="Vende 2 gorras")
+
+    response = client.post(
+        "/webhook",
+        content=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-Hub-Signature-256": "sha256=falsa"},
+    )
+
+    assert response.status_code == 403
+    assert consultar_inventario("Gorra")["stock"] == initial_stock
+
+
 def test_message_id_duplicado_ejecuta_agente_una_sola_vez():
     calls = []
     ids = RecentMessageIds()
@@ -134,6 +199,43 @@ def test_registro_de_ids_recientes_es_acotado():
     assert ids.claim("tres") is True
     assert ids.claim("dos") is False
     assert ids.claim("uno") is True
+
+
+def test_fallo_del_agente_deja_id_processing_y_no_reintenta():
+    ids = RecentMessageIds()
+    calls = []
+
+    def failing_agent(conversation_id, message):
+        calls.append(message)
+        raise RuntimeError("fallo simulado")
+
+    with pytest.raises(RuntimeError, match="fallo simulado"):
+        handle_webhook_payload(
+            text_payload(message_id="wamid.fail"),
+            agent=failing_agent,
+            sender=lambda to, message: SendResult(True),
+            message_ids=ids,
+        )
+
+    assert ids.status("wamid.fail") == "processing"
+    handle_webhook_payload(
+        text_payload(message_id="wamid.fail"),
+        agent=failing_agent,
+        sender=lambda to, message: SendResult(True),
+        message_ids=ids,
+    )
+    assert len(calls) == 1
+
+
+def test_id_se_completa_antes_del_intento_de_envio():
+    ids = RecentMessageIds()
+    handle_webhook_payload(
+        text_payload(message_id="wamid.complete"),
+        agent=lambda conversation_id, message: "OK",
+        sender=lambda to, message: SendResult(False, "fallo controlado"),
+        message_ids=ids,
+    )
+    assert ids.status("wamid.complete") == "completed"
 
 
 def test_venta_duplicada_no_descuenta_dos_veces(tmp_path, monkeypatch):
