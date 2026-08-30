@@ -1,8 +1,7 @@
 # Hackathon 2: agente de inventario por WhatsApp
 
-Base de un futuro agente de WhatsApp para gestionar inventario y ventas. La etapa
-actual incluye SQLite, lógica de negocio, una API local y un agente Llama servido
-por Groq con function calling.
+Agente de WhatsApp para gestionar inventario y ventas. La etapa actual integra
+WhatsApp Cloud API con SQLite y un agente Llama servido por Groq con function calling.
 
 ## Arquitectura actual
 
@@ -11,12 +10,19 @@ por Groq con function calling.
 - `app/agent.py`: schemas, whitelist y orquestación de las llamadas a herramientas.
 - `app/memory.py`: historial en proceso, aislado y sincronizado por conversación.
 - `app/security.py`: validación determinista de entradas y protección ligera de salidas.
-- `app/main.py`: endpoints locales, incluido `POST /agent/chat`.
+- `app/whatsapp.py`: parsing, idempotencia y envío mediante WhatsApp Cloud API.
+- `app/main.py`: API local y endpoints `GET/POST /webhook`.
 - `tests/test_tools.py`: pruebas aisladas con una base temporal por prueba.
 - `data/`: ubicación predeterminada de la base SQLite local.
 
-WhatsApp Cloud API, Meta, ngrok, Llama Guard, Prompt Guard y las demás capas de
-seguridad siguen pendientes para fases posteriores.
+El flujo actual es:
+
+```text
+WhatsApp -> webhook -> security -> memory -> Llama -> function calling
+         -> SQLite -> respuesta del agente -> WhatsApp Cloud API
+```
+
+Llama Guard, Prompt Guard y el despliegue productivo siguen pendientes.
 
 ## Preparación
 
@@ -39,6 +45,12 @@ $env:GROQ_API_KEY="tu_clave_local"
 ```
 
 No escribas la clave real en `.env.example` ni la agregues al repositorio.
+
+Para WhatsApp se necesitan además `WHATSAPP_VERIFY_TOKEN`,
+`WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` y, opcionalmente,
+`WHATSAPP_API_VERSION`. Si la última queda vacía o no existe, se usa `v23.0`.
+Todas deben definirse como variables del proceso; `.env.example` solo documenta
+los nombres y nunca debe contener valores reales.
 
 ## Ejecutar la API
 
@@ -88,6 +100,55 @@ recorta siempre pares `user`/`assistant`. Es memoria en proceso: se pierde al
 reiniciar la aplicación y solo es coherente dentro de un worker o instancia. Para
 escalar horizontalmente se necesitará más adelante un almacén compartido como
 Redis, que no forma parte de esta fase.
+
+## WhatsApp Cloud API y desarrollo local
+
+El endpoint `GET /webhook` realiza el handshake de Meta. `POST /webhook` acepta
+eventos y procesa únicamente mensajes `text`; estados de entrega/lectura, eventos
+sin mensajes e imágenes, audio, documentos o botones se reconocen como eventos
+sin acción y reciben HTTP 200.
+
+El campo `from` del mensaje entrante, correspondiente al identificador del
+remitente (`wa_id`), se utiliza como `conversation_id`. El `message_id` se reserva
+antes de invocar al agente para evitar que un webhook reenviado repita una venta o
+entrada. Se conservan como máximo 1,000 IDs recientes.
+
+Para exponer el servidor durante desarrollo:
+
+```powershell
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+ngrok http 8000
+```
+
+Configura en Meta la callback URL sin inventar o versionar una URL temporal:
+
+```text
+https://<subdominio-ngrok>/webhook
+```
+
+Usa el mismo valor local de `WHATSAPP_VERIFY_TOKEN` como verify token y suscribe
+el webhook al campo `messages`.
+
+Checklist de Meta for Developers:
+
+1. Crear o configurar una app y agregar el producto WhatsApp.
+2. Obtener el Phone Number ID y un Access Token apropiado.
+3. Configurar la callback URL pública terminada en `/webhook`.
+4. Introducir el verify token configurado localmente.
+5. Suscribirse al campo `messages`.
+6. Agregar el número receptor permitido si se usa el número de prueba/sandbox.
+7. Enviar un mensaje de prueba al número de WhatsApp configurado.
+
+El webhook funciona síncronamente en este MVP: espera al agente y al intento de
+envío antes de responder. Devuelve 200 incluso si el envío saliente falla para
+evitar reintentos y operaciones duplicadas; el fallo queda representado de forma
+controlada, sin tokens ni respuesta sensible de Meta. Esto puede ocasionar que una
+respuesta se pierda y no hay reintento saliente automático.
+
+La memoria conversacional y los IDs procesados viven únicamente en el proceso.
+Reiniciar el servidor los elimina y múltiples workers no los comparten. Un entorno
+productivo necesitaría Redis o almacenamiento compartido, procesamiento en cola,
+reintentos de salida y validación de firma del webhook con el App Secret.
 
 ## Seguridad del agente
 

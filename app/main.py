@@ -1,12 +1,17 @@
 """API local mínima del inventario."""
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+import os
+from typing import Any
+
+from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field, field_validator
 from app.agent import procesar_mensaje
 from app.database import initialize_database
 from app.memory import conversation_memory
 from app.tools import listar_productos
+from app.whatsapp import handle_webhook_payload
 
 
 @asynccontextmanager
@@ -52,3 +57,21 @@ def agent_chat(request: ChatRequest) -> ChatResponse:
 @app.delete("/agent/conversations/{conversation_id}")
 def clear_conversation(conversation_id: str) -> dict[str, bool]:
     return {"cleared": conversation_memory.clear(conversation_id)}
+
+
+@app.get("/webhook", response_class=PlainTextResponse)
+def verify_webhook(
+    mode: str = Query(alias="hub.mode"),
+    verify_token: str = Query(alias="hub.verify_token"),
+    challenge: str = Query(alias="hub.challenge"),
+) -> str:
+    expected_token = os.getenv("WHATSAPP_VERIFY_TOKEN")
+    if mode == "subscribe" and expected_token and verify_token == expected_token:
+        return challenge
+    raise HTTPException(status_code=403, detail="Webhook verification failed.")
+
+
+@app.post("/webhook")
+def receive_webhook(payload: Any = Body(...)) -> dict[str, str]:
+    handle_webhook_payload(payload)
+    return {"status": "received"}
