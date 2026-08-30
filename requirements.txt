@@ -1,5 +1,5 @@
 fastapi
-groq
 httpx
+python-dotenv
 uvicorn
 pytest

@@ -36,7 +36,7 @@ INPUT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "secrets",
         (
-            r"\b(groq_api_key|api[ -]?key|clave (?:de )?api|access token|token de acceso)\b",
+            r"\b(openrouter_api_key|groq_api_key|api[ -]?key|clave (?:de )?api|access token|token de acceso)\b",
             r"\b(revela|muestra|dime|show|reveal|extract)\b.{0,50}\b(secreto|secret|token|credencial)\b",
         ),
     ),
@@ -83,7 +83,7 @@ def check_model_output(output: str, system_prompt: str) -> SecurityResult:
     if not isinstance(output, str):
         return SecurityResult(False, "La respuesta no es texto.", "invalid_output")
     normalized = _normalize(output)
-    if "groq_api_key" in normalized or "prompt del sistema" in normalized or "system prompt" in normalized:
+    if any(marker in normalized for marker in ("openrouter_api_key", "groq_api_key", "prompt del sistema", "system prompt")):
         return SecurityResult(False, "La respuesta contiene indicadores sensibles.", "sensitive_output")
     if system_prompt and system_prompt in output:
         return SecurityResult(False, "La respuesta replica instrucciones internas.", "internal_instructions")

@@ -1,33 +1,34 @@
-from types import SimpleNamespace
-
 import pytest
 
 from app import database
 from app.agent import procesar_mensaje
 from app.memory import ConversationMemory, conversation_memory
+from app.openrouter import OpenRouterError
 from app.security import SAFE_OUTPUT_REJECTION, SAFE_REJECTION
 from app.tools import consultar_inventario
 
 
 def respuesta_tool(nombre, argumentos, *, tool_id="call_1"):
-    call = SimpleNamespace(
-        id=tool_id,
-        function=SimpleNamespace(name=nombre, arguments=argumentos),
-    )
-    message = SimpleNamespace(content=None, tool_calls=[call])
-    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+    return {
+        "content": None,
+        "tool_calls": [
+            {
+                "id": tool_id,
+                "type": "function",
+                "function": {"name": nombre, "arguments": argumentos},
+            }
+        ],
+    }
 
 
 def respuesta_texto(contenido):
-    message = SimpleNamespace(content=contenido, tool_calls=None)
-    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+    return {"content": contenido}
 
 
 class ClienteFake:
     def __init__(self, *respuestas):
         self.respuestas = list(respuestas)
         self.requests = []
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
     def create(self, **kwargs):
         self.requests.append(kwargs)
@@ -56,7 +57,11 @@ def test_operaciones_de_lectura(nombre, argumentos, texto_final):
     assert procesar_mensaje("test", "Consulta el inventario", client=client) == texto_final
     tool_result = client.requests[1]["messages"][-1]
     assert tool_result["role"] == "tool"
+    assert tool_result["tool_call_id"] == "call_1"
     assert '"ok": true' in tool_result["content"]
+    assistant_tool_call = client.requests[1]["messages"][-2]
+    assert assistant_tool_call["role"] == "assistant"
+    assert assistant_tool_call["tool_calls"][0]["function"]["name"] == nombre
 
 
 def test_entrada_pasa_por_la_funcion_real_de_negocio():
@@ -113,17 +118,43 @@ def test_argumentos_invalidos_no_se_ejecutan(argumentos):
     assert consultar_inventario("Gorra")["stock"] == 8
 
 
-def test_error_del_proveedor_es_controlado():
-    client = ClienteFake(RuntimeError("error que no debe mostrarse"))
+def test_tool_call_malformado_no_se_ejecuta():
+    client = ClienteFake({"content": None, "tool_calls": [{"id": "call_1"}]})
     respuesta = procesar_mensaje("test", "Lista productos", client=client)
-    assert respuesta == "No fue posible comunicarse con el proveedor Groq. Inténtalo de nuevo más tarde."
-    assert "error que no debe mostrarse" not in respuesta
+    assert "tool call" in respuesta
+
+
+def test_error_del_proveedor_es_controlado(caplog):
+    client = ClienteFake(RuntimeError("secreto que no debe mostrarse"))
+    respuesta = procesar_mensaje("test", "Lista productos", client=client)
+    assert respuesta == "No fue posible comunicarse con el proveedor de IA."
+    assert "secreto que no debe mostrarse" not in respuesta
+    assert "secreto que no debe mostrarse" not in caplog.text
+    assert "category=unexpected" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("category", "expected"),
+    [
+        ("authentication", "autenticar"),
+        ("model_not_found", "modelo"),
+        ("rate_limit", "límite"),
+        ("timeout", "demasiado"),
+        ("server", "temporalmente"),
+        ("invalid_response", "inválida"),
+    ],
+)
+def test_errores_openrouter_tienen_respuesta_sanitizada(category, expected):
+    client = ClienteFake(OpenRouterError(category, status_code=500, code="codigo"))
+    response = procesar_mensaje("test", "Lista productos", client=client)
+    assert expected in response
+    assert "codigo" not in response
 
 
 def test_ausencia_de_api_key(monkeypatch):
-    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     respuesta = procesar_mensaje("test", "Lista productos")
-    assert respuesta == "El agente no está configurado: falta la variable GROQ_API_KEY."
+    assert respuesta == "El agente no está configurado: falta la variable OPENROUTER_API_KEY."
 
 
 def test_segundo_turno_recibe_contexto_y_resuelve_una_venta():
@@ -190,7 +221,7 @@ def test_conversation_id_invalido_se_rechaza(conversation_id):
     assert client.requests == []
 
 
-def test_mensaje_bloqueado_no_llama_groq_no_ejecuta_tool_ni_contamina_memoria():
+def test_mensaje_bloqueado_no_llama_proveedor_no_ejecuta_tool_ni_contamina_memoria():
     memory = ConversationMemory()
     client = ClienteFake(respuesta_tool("registrar_venta", '{"producto":"Gorra","cantidad":2}'))
 
@@ -238,17 +269,32 @@ def test_respuesta_del_modelo_con_secreto_se_bloquea_y_no_se_guarda(monkeypatch)
     assert "secreto-simulado-987" not in str(memory.get_history("demo"))
 
 
-def test_cliente_groq_recibe_timeout_explicito(monkeypatch):
+def test_cliente_openrouter_recibe_timeout_explicito(monkeypatch):
     import app.agent as agent_module
 
     captured = {}
     fake_client = ClienteFake(respuesta_texto("Respuesta directa"))
 
-    def fake_groq(**kwargs):
+    def fake_openrouter(**kwargs):
         captured.update(kwargs)
         return fake_client
 
-    monkeypatch.setenv("GROQ_API_KEY", "groq-key-de-prueba")
-    monkeypatch.setattr(agent_module, "Groq", fake_groq)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key-de-prueba")
+    monkeypatch.setattr(agent_module, "OpenRouterClient", fake_openrouter)
     assert agent_module.procesar_mensaje("timeout", "Lista productos") == "Respuesta directa"
-    assert captured == {"api_key": "groq-key-de-prueba", "timeout": 30.0}
+    assert captured == {"api_key": "openrouter-key-de-prueba", "timeout": 30.0}
+
+
+def test_error_al_inicializar_openrouter_es_controlado_y_sanitizado(monkeypatch, caplog):
+    import app.agent as agent_module
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key-de-prueba")
+    monkeypatch.setattr(
+        agent_module,
+        "OpenRouterClient",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("openrouter-key-de-prueba")),
+    )
+    response = agent_module.procesar_mensaje("init-error", "Lista productos")
+    assert response == "No fue posible inicializar el proveedor de IA. Revisa la configuración."
+    assert "openrouter-key-de-prueba" not in response
+    assert "openrouter-key-de-prueba" not in caplog.text
